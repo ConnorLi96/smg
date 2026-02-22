@@ -8,11 +8,12 @@ use std::{
 
 use axum::{
     extract::{Path, Query, Request, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -73,6 +74,8 @@ pub struct AppState {
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
+    /// Handle for rendering SMG's own Prometheus metrics at `/metrics`.
+    pub prometheus_handle: Option<PrometheusHandle>,
 }
 
 async fn parse_function_call(
@@ -154,6 +157,26 @@ async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
     WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
         .await
         .into_response()
+}
+
+/// Serves SMG's own Prometheus metrics (`smg_*`) at `/metrics`.
+///
+/// This makes SMG consistent with vLLM, TGI, and other inference engines that
+/// expose metrics on the same port as their API, eliminating the need for a
+/// separate `--prometheus-port`.
+async fn smg_metrics(State(state): State<Arc<AppState>>) -> Response {
+    match &state.prometheus_handle {
+        Some(handle) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            handle.render(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -618,6 +641,7 @@ pub fn build_app(
         .route("/readiness", get(readiness))
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
+        .route("/metrics", get(smg_metrics))
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
@@ -746,9 +770,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         None
     };
 
-    if let Some(prometheus_config) = &config.prometheus_config {
-        metrics::start_prometheus(prometheus_config.clone());
-    }
+    let prometheus_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
+        let handle = metrics::install_prometheus_recorder(prometheus_config);
+        info!(
+            "Prometheus metrics available at http://{}:{}/metrics",
+            config.host, config.port
+        );
+        handle
+    });
 
     // Initialize mesh server if configured, it will return a handler for mesh management
     let mesh_handler = if let Some(mesh_server_config) = &config.mesh_server_config {
@@ -782,7 +811,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
 
-    if config.prometheus_config.is_some() {
+    if prometheus_handle.is_some() {
         app_context.inflight_tracker.start_sampler(20);
     }
 
@@ -961,6 +990,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
         mesh_handler,
+        prometheus_handle,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
