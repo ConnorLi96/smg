@@ -48,6 +48,10 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 worker_id
             );
             worker_ids.push(worker_id);
+
+            // Initialize active request count to 0 at registration time so the metric
+            // is visible immediately, even before any inference requests arrive.
+            Metrics::set_worker_requests_active(worker.url(), 0);
         }
 
         // Collect unique worker configurations to avoid redundant metric updates
